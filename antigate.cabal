@@ -1,0 +1,28 @@
+name: antigate
+version: 0.0.1
+synopsis: Interface for antigate.com captcha recognition service.
+description: Interface for antigate.com captcha recognition service.
+category: Network APIs, CAPTCHA, Text Recognition
+license: MIT
+license-file: LICENSE
+author: kudah
+maintainer: kudah@jabber.ru
+cabal-version: >= 1.8
+build-type: Simple
+tested-with: GHC == 7.4.1
+
+library
+    exposed-modules: Text.Recognition.Antigate
+
+    build-depends: base == 4.*
+                  ,random
+                  ,safe
+                  ,data-default
+                  ,bytestring
+                  ,utf8-string
+                  ,mime-types
+                  ,http-types
+                  ,http-conduit
+
+    ghc-options: -Wall
+
