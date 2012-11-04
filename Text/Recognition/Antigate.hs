@@ -1,6 +1,4 @@
 {-# LANGUAGE PatternGuards, OverloadedStrings, ScopedTypeVariables, DeriveDataTypeable #-}
-{-# LANGUAGE CPP #-}
-
 module Text.Recognition.Antigate
     (AntigateKey
     ,CaptchaID
@@ -19,20 +17,21 @@ module Text.Recognition.Antigate
     ,getBalance
     -- * Miscellaneous
     ,parseUploadResult
-    ,renderUploadResult
     ,parseCheckResult
+    ,parseCheckResults
     ,parseCheckResultNoOK
+    ,renderUploadResult
     ,renderCheckResult
     ) where
 import Control.Arrow (first)
-import Control.Applicative ((<$>), (<$))
+import Control.Monad (void)
+import Control.Applicative ((<$>))
 import Control.Concurrent (threadDelay)
-import Control.Exception (Exception, handle, throwIO)
+import Control.Exception (Exception, throwIO)
 import qualified Codec.Binary.UTF8.Generic as UTF8 (fromString, toString)
 import qualified Data.ByteString as S (concat)
 import Data.ByteString.Lazy.Char8()
 import Data.Default (Default(..))
-import Data.Function (fix)
 import Data.List (stripPrefix, isPrefixOf, intercalate)
 import Data.Monoid ((<>))
 import Data.Maybe (catMaybes, fromMaybe, fromJust)
@@ -46,16 +45,11 @@ import qualified Data.ByteString.Lazy as L
 import Network.HTTP.Types
 import System.Random
 import Network.HTTP.Conduit
-import System.Timeout(timeout)
 
 httpRequest :: String -> IO L.ByteString
-#if MIN_VERSION_http_conduit(1,6,0)
 httpRequest u =
     responseBody <$> withManager
-        (httpLbs (fromJust $ parseUrl u){responseTimeout = Just 30000000})
-#else
-httpRequest u = timeout 30000000 $ simpleHttp u
-#endif
+        (httpLbs (fromJust $ parseUrl u){responseTimeout = Just 15000000})
 
 delimit :: Char -> String -> [String]
 delimit _ [] = []
@@ -82,8 +76,8 @@ randomString len =
 
 randomBoundary :: IO L.ByteString
 randomBoundary = do
-    dashlen <- randomRIO (10,40)
-    charlen <- randomRIO (20,40)
+    dashlen <- randomRIO (5, 30)
+    charlen <- randomRIO (10, 30)
     fromString . (replicate dashlen '-' ++) <$> getStdRandom (randomString charlen)
 
 type AntigateKey = String
@@ -95,7 +89,7 @@ data CaptchaConf = CaptchaConf
     {phrase :: Bool -- ^ * 'False' = default value (one word)
                     --
                     -- * 'True' = captcha has 2-4 words
-    ,regsense :: Bool -- ^ * 'False' = default value (case is not important,
+    ,regsense :: Bool -- ^ * 'False' = default value (case is not important)
                       --
                       -- * 'True' = captcha is case sensitive
     ,numeric :: Maybe Bool -- ^ * 'Nothing' = default value
@@ -197,12 +191,11 @@ captchaConfFields c = catMaybes
 
 -- | report bad captcha result
 --
--- returns 'False' on network errors.
-reportBad :: AntigateKey -> CaptchaID -> IO Bool
-reportBad key captchaid = 
-    handle (\(_::HttpException) -> return False) $ do
-        True <$ httpRequest
-            ("http://antigate.com/res.php?key="++ key ++"&action=reportbad&id=" ++ show captchaid)
+-- throws 'HttpException' on network errors.
+reportBad :: AntigateKey -> CaptchaID -> IO ()
+reportBad key captchaid =
+    void $ httpRequest
+        ("http://antigate.com/res.php?key="++ key ++"&action=reportbad&id=" ++ show captchaid)
 
 -- | retrieve your current account balance
 --
@@ -253,6 +246,14 @@ renderCheckResult (CHECK_OK s) = "OK|" ++ s
 renderCheckResult (CHECK_ERROR_UNKNOWN s) = s
 renderCheckResult a = show a
 
+-- | Parse antigate's check response
+parseCheckResult :: String -> CheckResult
+parseCheckResult "ERROR_KEY_DOES_NOT_EXIST" = CHECK_ERROR_KEY_DOES_NOT_EXIST
+parseCheckResult s
+    | Just e <- readMay s = e
+    | otherwise = fromMaybe (CHECK_ERROR_UNKNOWN s) $
+                        CHECK_OK <$> stripPrefix "OK|" s
+
 -- | Parse antigate's multi-check response
 parseCheckResultNoOK :: String -> CheckResult
 parseCheckResultNoOK "ERROR_KEY_DOES_NOT_EXIST" = CHECK_ERROR_KEY_DOES_NOT_EXIST
@@ -261,13 +262,9 @@ parseCheckResultNoOK s
     | isPrefixOf "ERROR_" s = CHECK_ERROR_UNKNOWN s
     | otherwise = CHECK_OK s
 
--- | Parse antigate's check response
-parseCheckResult :: String -> CheckResult
-parseCheckResult "ERROR_KEY_DOES_NOT_EXIST" = CHECK_ERROR_KEY_DOES_NOT_EXIST
-parseCheckResult s
-    | Just e <- readMay s = e
-    | otherwise = fromMaybe (CHECK_ERROR_UNKNOWN s) $
-                        CHECK_OK <$> stripPrefix "OK|" s
+-- | Parse antigate's multi-check response
+parseCheckResults :: String -> [CheckResult]
+parseCheckResults = map parseCheckResultNoOK . delimit '|'
 
 -- | retrieve captcha status
 --
@@ -282,7 +279,7 @@ checkCaptcha key captchaid = do
 -- throws 'HttpException' on network errors.
 checkCaptchas :: AntigateKey -> [CaptchaID] -> IO [CheckResult]
 checkCaptchas key captchaids = do
-    map parseCheckResultNoOK . delimit '|' . UTF8.toString <$> httpRequest
+    parseCheckResults . UTF8.toString <$> httpRequest
         ("http://antigate.com/res.php?key="++ key ++"&action=get&ids="++
             intercalate "," (map show captchaids))
 
@@ -292,33 +289,35 @@ data SolveException = SolveExceptionUpload UploadResult
 
 instance Exception SolveException
 
--- | High level function to solve captcha
+-- | High level function to solve captcha, blocks until answer is provided (about 2-10 seconds).
 --
 -- throws 'SolveException' or 'HttpException' when something goes wrong.
 solveCaptcha :: Int -- ^ how much to sleep while waiting for available slot. Microseconds.
              -> Int -- ^ how much to sleep between captcha checks. Microseconds.
              -> AntigateKey
              -> CaptchaConf
-             -> FilePath -- ^ image filename (used to guess type)
+             -> FilePath -- ^ image filename (antigate guesses filetype by file extension)
              -> L.ByteString -- ^ image contents
              -> IO (CaptchaID, String)
-solveCaptcha sleepwait sleepcaptcha key conf filename image = do
-    ur <- uploadCaptcha key conf filename image
-    case ur of
-        ERROR_NO_SLOT_AVAILABLE -> do
-            threadDelay sleepwait
-            solveCaptcha sleepwait sleepcaptcha key conf filename image
-        UPLOAD_OK i -> fix $ \this -> do
+solveCaptcha sleepwait sleepcaptcha key conf filename image = goupload
+  where goupload = do
+            ur <- uploadCaptcha key conf filename image
+            case ur of
+                ERROR_NO_SLOT_AVAILABLE -> do
+                    threadDelay sleepwait
+                    goupload
+                UPLOAD_OK i -> gocheck i
+                a -> throwIO $ SolveExceptionUpload a
+        gocheck captchaid = do
             threadDelay sleepcaptcha
-            res <- checkCaptcha key i
+            res <- checkCaptcha key captchaid
             case res of
-                CHECK_OK captcha ->
-                    return (i, captcha)
+                CHECK_OK answer ->
+                    return (captchaid, answer)
                 CAPCHA_NOT_READY -> do
                     threadDelay sleepcaptcha
-                    this
-                a -> throwIO $ SolveExceptionCheck i a
-        a -> throwIO $ SolveExceptionUpload a
+                    gocheck captchaid
+                ex -> throwIO $ SolveExceptionCheck captchaid ex
 
 -- | Same as 'solveCaptcha', but read contents from a file.
 solveCaptchaFromFile :: Int -> Int -> AntigateKey -> CaptchaConf -> FilePath -> IO (CaptchaID, String)
