@@ -1,5 +1,5 @@
 name: antigate
-version: 0.1.0
+version: 0.1.1
 synopsis: Interface for antigate.com captcha recognition service.
 description: Interface for antigate.com captcha recognition service.
 category: Network APIs, CAPTCHA, Text Recognition
@@ -23,7 +23,7 @@ library
                   ,safe
                   ,data-default
                   ,bytestring
-                  ,utf8-string
+                  ,text
                   ,mime-types
                   ,http-types
                   ,http-conduit >= 1.6.0.1

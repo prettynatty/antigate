@@ -68,8 +68,9 @@ import Control.Monad (void)
 import Control.Applicative ((<$>))
 import Control.Concurrent (threadDelay)
 import Control.Exception (Exception, throwIO)
-import qualified Data.ByteString.UTF8 as SUTF8 (fromString)
-import qualified Data.ByteString.Lazy.UTF8 as LUTF8 (toString)
+import qualified Data.Text.Lazy as TL (unpack)
+import qualified Data.Text.Lazy.Encoding as TL (decodeUtf8)
+import qualified Blaze.ByteString.Builder.Char.Utf8 as BlazeUtf8 (fromString)
 import qualified Data.ByteString as S (ByteString, readFile)
 import Data.ByteString.Lazy.Char8()
 import Data.Default (Default(..))
@@ -245,7 +246,7 @@ reportBad key captchaid =
 -- throws 'HttpException' on network errors.
 getBalance :: (MonadBaseControl IO m, MonadResource m) => AntigateKey -> Manager -> m Double
 getBalance key m =
-    read . LUTF8.toString <$> httpRequest
+    read . TL.unpack . TL.decodeUtf8 <$> httpRequest
         ("http://antigate.com/res.php?key="++ key ++"&action=getbalance") m
 
 -- | Marshal "UploadResult" back to its text form
@@ -276,12 +277,12 @@ uploadCaptcha key sets filename image m = do
                 ,Part "key" (fromString key)
                 ] ++
                 captchaConfFields sets ++
-                [File "file" (SUTF8.fromString filename)
+                [File "file" (toByteString $ BlazeUtf8.fromString filename)
                     (defaultMimeLookup (fromString filename))
                     image
                 ]
                 }
-    parseUploadResult . LUTF8.toString . responseBody <$> httpLbs req m
+    parseUploadResult . TL.unpack . TL.decodeUtf8 . responseBody <$> httpLbs req m
 
 -- | Marshal "CheckResult" back to its text form 
 renderCheckResult :: CheckResult -> String
@@ -314,7 +315,7 @@ parseCheckResults = map parseCheckResultNoOK . delimit '|'
 -- throws 'HttpException' on network errors.
 checkCaptcha :: (MonadBaseControl IO m, MonadResource m) => AntigateKey -> CaptchaID -> Manager -> m CheckResult
 checkCaptcha key captchaid m = do
-    parseCheckResult . LUTF8.toString <$> httpRequest
+    parseCheckResult . TL.unpack . TL.decodeUtf8 <$> httpRequest
         ("http://antigate.com/res.php?key="++ key ++"&action=get&id="++ show captchaid) m
 
 -- | retrieve multiple captcha status
@@ -322,7 +323,7 @@ checkCaptcha key captchaid m = do
 -- throws 'HttpException' on network errors.
 checkCaptchas :: (MonadBaseControl IO m, MonadResource m) => AntigateKey -> [CaptchaID] -> Manager -> m [CheckResult]
 checkCaptchas key captchaids m = do
-    parseCheckResults . LUTF8.toString <$> httpRequest
+    parseCheckResults . TL.unpack . TL.decodeUtf8 <$> httpRequest
         ("http://antigate.com/res.php?key="++ key ++"&action=get&ids="++
             intercalate "," (map show captchaids)) m
 
