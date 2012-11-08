@@ -1,4 +1,39 @@
-{-# LANGUAGE PatternGuards, OverloadedStrings, ScopedTypeVariables, DeriveDataTypeable #-}
+{-# LANGUAGE PatternGuards, OverloadedStrings, DeriveDataTypeable, FlexibleContexts #-}
+-- | Example:
+--
+-- > import Text.Recognition.Antigate
+-- > import Data.Default
+-- > import Network
+-- > import Control.Monad
+-- > import Control.Monad.IO.Class
+-- > import Data.ByteString hiding (putStrLn)
+-- > import System.Timeout
+-- > 
+-- > myAntigateKey :: String
+-- > myAntigateKey = "0123456789abcdef0123456789abcdef"
+-- > 
+-- > downloadJpegCaptcha :: Manager -> IO ByteString
+-- > downloadJpegCaptcha = undefined
+-- > 
+-- > answerCaptcha :: String -> Manager -> IO Bool
+-- > answerCaptcha = undefined
+-- > 
+-- > main :: IO ()
+-- > main = withSocketsDo $ do
+-- >     res <- timeout (30*1000000) $ withManager $ \m -> do
+-- >         bytes <- liftIO $ downloadJpegCaptcha m
+-- >         (id, answer) <- solveCaptcha (3*1000000) (3*1000000) myAntigateKey def{phrase=True} "captcha.jpg" bytes m
+-- >         res <- liftIO $ answerCaptcha answer m
+-- >         unless res $ reportBad myAntigateKey id m
+-- >         return res
+-- >     case res of
+-- >         Nothing -> do
+-- >             putStrLn "Timed out"
+-- >         Just True -> do
+-- >             putStrLn "Solved successfully"
+-- >         Just False -> do
+-- >             putStrLn "Couldn't solve"
+
 module Text.Recognition.Antigate
     (AntigateKey
     ,CaptchaID
@@ -15,6 +50,11 @@ module Text.Recognition.Antigate
     ,checkCaptchas
     ,reportBad
     ,getBalance
+    -- * Connection manager
+    ,Manager
+    ,newManager
+    ,closeManager
+    ,withManager
     -- * Miscellaneous
     ,parseUploadResult
     ,parseCheckResult
@@ -28,12 +68,13 @@ import Control.Monad (void)
 import Control.Applicative ((<$>))
 import Control.Concurrent (threadDelay)
 import Control.Exception (Exception, throwIO)
-import qualified Codec.Binary.UTF8.Generic as UTF8 (fromString, toString)
-import qualified Data.ByteString as S (concat)
+import qualified Data.ByteString.UTF8 as SUTF8 (fromString)
+import qualified Data.ByteString.Lazy.UTF8 as LUTF8 (toString)
+import qualified Data.ByteString as S (ByteString, readFile)
 import Data.ByteString.Lazy.Char8()
 import Data.Default (Default(..))
 import Data.List (stripPrefix, isPrefixOf, intercalate)
-import Data.Monoid ((<>))
+import Data.Monoid ((<>), mconcat)
 import Data.Maybe (catMaybes, fromMaybe, fromJust)
 import Data.String (fromString)
 import Data.Typeable (Typeable)
@@ -42,14 +83,17 @@ import Network.Mime (defaultMimeLookup)
 import Safe (readMay)
 import Text.Printf (printf)
 import qualified Data.ByteString.Lazy as L
+import Control.Monad.Trans.Resource
+import Control.Monad.IO.Class (liftIO)
 import Network.HTTP.Types
 import System.Random
 import Network.HTTP.Conduit
+import Blaze.ByteString.Builder
 
-httpRequest :: String -> IO L.ByteString
-httpRequest u =
-    responseBody <$> withManager
-        (httpLbs (fromJust $ parseUrl u){responseTimeout = Just 15000000})
+httpRequest :: (MonadBaseControl IO m, MonadResource m) => String -> Manager -> m L.ByteString
+httpRequest u m = do
+    rq <- liftIO $ parseUrl u
+    responseBody <$> httpLbs rq{responseTimeout = Just 15000000} m
 
 delimit :: Char -> String -> [String]
 delimit _ [] = []
@@ -74,7 +118,7 @@ randomString len =
         | i < 52 = toEnum $ i + fromEnum 'a' - 26
         | otherwise = toEnum $ i + fromEnum '0' - 52
 
-randomBoundary :: IO L.ByteString
+randomBoundary :: IO S.ByteString
 randomBoundary = do
     dashlen <- randomRIO (5, 30)
     charlen <- randomRIO (10, 30)
@@ -133,8 +177,8 @@ data CheckResult = CHECK_OK String -- ^ the captcha is recognized, the guessed t
                  | CHECK_ERROR_UNKNOWN String
     deriving (Show, Read, Eq, Ord)
 
-data Field = Part L.ByteString L.ByteString
-           | File L.ByteString L.ByteString L.ByteString L.ByteString
+data Field = Part S.ByteString S.ByteString
+           | File S.ByteString S.ByteString S.ByteString S.ByteString
     deriving (Show)
 
 instance Default CaptchaConf where
@@ -148,22 +192,21 @@ instance Default CaptchaConf where
                       ,max_bid = Nothing
                       }
 
-renderField :: L.ByteString -> Field -> L.ByteString
+renderField :: S.ByteString -> Field -> Builder
 renderField boundary (Part name body) =
-    "--" <> boundary <> "\r\n"
-    <> "Content-Disposition: form-data; name=\"" <> name <> "\""
-    <> "\r\n"
-    <> "\r\n" <> body <> "\r\n"
+    copyByteString "--" <> copyByteString boundary <> copyByteString "\r\n"
+    <> copyByteString "Content-Disposition: form-data; name=\"" <> fromByteString name <>
+    copyByteString "\"\r\n\r\n" <> fromByteString body <> copyByteString "\r\n"
 renderField boundary (File name filename contenttype body) =
-    "--" <> boundary <> "\r\n"
-    <> "Content-Disposition: form-data; name=\"" <> name <> "\"; filename=\"" <> filename <> "\""
-    <> "\r\n" <> "Content-Type: " <> contenttype <> "\r\n"
-    <> "\r\n" <> body <> "\r\n"
+    copyByteString "--" <> copyByteString boundary <> copyByteString "\r\n"
+    <> copyByteString "Content-Disposition: form-data; name=\"" <> fromByteString name <> copyByteString "\"; filename=\"" <> fromByteString filename
+    <> copyByteString "\"\r\nContent-Type: " <> copyByteString contenttype
+    <> copyByteString "\r\n\r\n" <> fromByteString body <> copyByteString "\r\n"
 
-renderFields :: L.ByteString -> [Field] -> L.ByteString
+renderFields :: S.ByteString -> [Field] -> Builder
 renderFields boundary fields =
-    L.concat (map (renderField boundary) fields)
-        <> "--" <> boundary <> "--\r\n"
+    mconcat (map (renderField boundary) fields)
+        <> copyByteString "--" <> copyByteString boundary <> copyByteString "--\r\n"
 
 captchaConfFields :: CaptchaConf -> [Field]
 captchaConfFields c = catMaybes
@@ -181,7 +224,7 @@ captchaConfFields c = catMaybes
           fromTri Nothing = "0"
           fromTri (Just True) = "1"
           fromTri (Just False) = "2"
-          optField :: Eq a => L.ByteString -> (a -> L.ByteString) -> (CaptchaConf -> a) -> Maybe Field
+          optField :: Eq a => S.ByteString -> (a -> S.ByteString) -> (CaptchaConf -> a) -> Maybe Field
           optField name conv rec
             | rec c /= rec def = Just $ Part name $ conv $ rec c
             | otherwise = Nothing
@@ -192,18 +235,18 @@ captchaConfFields c = catMaybes
 -- | report bad captcha result
 --
 -- throws 'HttpException' on network errors.
-reportBad :: AntigateKey -> CaptchaID -> IO ()
+reportBad :: (MonadBaseControl IO m, MonadResource m) => AntigateKey -> CaptchaID -> Manager -> m ()
 reportBad key captchaid =
-    void $ httpRequest
+    void . httpRequest
         ("http://antigate.com/res.php?key="++ key ++"&action=reportbad&id=" ++ show captchaid)
 
 -- | retrieve your current account balance
 --
 -- throws 'HttpException' on network errors.
-getBalance :: AntigateKey -> IO Double
-getBalance key =
-    read . UTF8.toString <$> httpRequest
-        ("http://antigate.com/res.php?key="++ key ++"&action=getbalance")
+getBalance :: (MonadBaseControl IO m, MonadResource m) => AntigateKey -> Manager -> m Double
+getBalance key m =
+    read . LUTF8.toString <$> httpRequest
+        ("http://antigate.com/res.php?key="++ key ++"&action=getbalance") m
 
 -- | Marshal "UploadResult" back to its text form
 renderUploadResult :: UploadResult -> String
@@ -222,23 +265,23 @@ parseUploadResult s
 -- | upload captcha for recognition
 --
 -- throws 'HttpException' on network errors.
-uploadCaptcha :: AntigateKey -> CaptchaConf -> FilePath -> L.ByteString -> IO UploadResult
-uploadCaptcha key sets filename image = do
-    boundary <- randomBoundary
+uploadCaptcha :: (MonadBaseControl IO m, MonadResource m) => AntigateKey -> CaptchaConf -> FilePath -> S.ByteString -> Manager -> m UploadResult
+uploadCaptcha key sets filename image m = do
+    boundary <- liftIO $ randomBoundary
     let req = (fromJust $ parseUrl "http://antigate.com/in.php")
             {method = methodPost
-            ,requestHeaders = [(hContentType, S.concat $ L.toChunks $ "multipart/form-data; boundary=" <> boundary)]
-            ,requestBody = RequestBodyLBS $ renderFields boundary $
+            ,requestHeaders = [(hContentType, "multipart/form-data; boundary=" <> boundary)]
+            ,requestBody = RequestBodyLBS $ toLazyByteString $ renderFields boundary $
                 [Part "method" "post"
                 ,Part "key" (fromString key)
                 ] ++
                 captchaConfFields sets ++
-                [File "file" (UTF8.fromString filename)
-                    (L.fromChunks [defaultMimeLookup (fromString filename)])
+                [File "file" (SUTF8.fromString filename)
+                    (defaultMimeLookup (fromString filename))
                     image
                 ]
                 }
-    parseUploadResult . UTF8.toString . responseBody <$> withManager (httpLbs req)
+    parseUploadResult . LUTF8.toString . responseBody <$> httpLbs req m
 
 -- | Marshal "CheckResult" back to its text form 
 renderCheckResult :: CheckResult -> String
@@ -269,19 +312,19 @@ parseCheckResults = map parseCheckResultNoOK . delimit '|'
 -- | retrieve captcha status
 --
 -- throws 'HttpException' on network errors.
-checkCaptcha :: AntigateKey -> CaptchaID -> IO CheckResult
-checkCaptcha key captchaid = do
-    parseCheckResult . UTF8.toString <$> httpRequest
-        ("http://antigate.com/res.php?key="++ key ++"&action=get&id="++ show captchaid)
+checkCaptcha :: (MonadBaseControl IO m, MonadResource m) => AntigateKey -> CaptchaID -> Manager -> m CheckResult
+checkCaptcha key captchaid m = do
+    parseCheckResult . LUTF8.toString <$> httpRequest
+        ("http://antigate.com/res.php?key="++ key ++"&action=get&id="++ show captchaid) m
 
 -- | retrieve multiple captcha status
 --
 -- throws 'HttpException' on network errors.
-checkCaptchas :: AntigateKey -> [CaptchaID] -> IO [CheckResult]
-checkCaptchas key captchaids = do
-    parseCheckResults . UTF8.toString <$> httpRequest
+checkCaptchas :: (MonadBaseControl IO m, MonadResource m) => AntigateKey -> [CaptchaID] -> Manager -> m [CheckResult]
+checkCaptchas key captchaids m = do
+    parseCheckResults . LUTF8.toString <$> httpRequest
         ("http://antigate.com/res.php?key="++ key ++"&action=get&ids="++
-            intercalate "," (map show captchaids))
+            intercalate "," (map show captchaids)) m
 
 data SolveException = SolveExceptionUpload UploadResult
                     | SolveExceptionCheck CaptchaID CheckResult
@@ -292,33 +335,36 @@ instance Exception SolveException
 -- | High level function to solve captcha, blocks until answer is provided (about 2-10 seconds).
 --
 -- throws 'SolveException' or 'HttpException' when something goes wrong.
-solveCaptcha :: Int -- ^ how much to sleep while waiting for available slot. Microseconds.
+solveCaptcha :: (MonadBaseControl IO m, MonadResource m) =>
+                Int -- ^ how much to sleep while waiting for available slot. Microseconds.
              -> Int -- ^ how much to sleep between captcha checks. Microseconds.
              -> AntigateKey
              -> CaptchaConf
              -> FilePath -- ^ image filename (antigate guesses filetype by file extension)
-             -> L.ByteString -- ^ image contents
-             -> IO (CaptchaID, String)
-solveCaptcha sleepwait sleepcaptcha key conf filename image = goupload
+             -> S.ByteString -- ^ image contents
+             -> Manager -- ^ HTTP connection manager to use
+             -> m (CaptchaID, String)
+solveCaptcha sleepwait sleepcaptcha key conf filename image m = goupload
   where goupload = do
-            ur <- uploadCaptcha key conf filename image
+            ur <- uploadCaptcha key conf filename image m
             case ur of
                 ERROR_NO_SLOT_AVAILABLE -> do
-                    threadDelay sleepwait
+                    liftIO $ threadDelay sleepwait
                     goupload
                 UPLOAD_OK i -> gocheck i
-                a -> throwIO $ SolveExceptionUpload a
+                a -> liftIO $ throwIO $ SolveExceptionUpload a
         gocheck captchaid = do
-            threadDelay sleepcaptcha
-            res <- checkCaptcha key captchaid
+            liftIO $ threadDelay sleepcaptcha
+            res <- checkCaptcha key captchaid m
             case res of
                 CHECK_OK answer ->
                     return (captchaid, answer)
                 CAPCHA_NOT_READY -> do
-                    threadDelay sleepcaptcha
+                    liftIO $ threadDelay sleepcaptcha
                     gocheck captchaid
-                ex -> throwIO $ SolveExceptionCheck captchaid ex
+                ex -> liftIO $ throwIO $ SolveExceptionCheck captchaid ex
 
 -- | Same as 'solveCaptcha', but read contents from a file.
-solveCaptchaFromFile :: Int -> Int -> AntigateKey -> CaptchaConf -> FilePath -> IO (CaptchaID, String)
-solveCaptchaFromFile a b c d f = solveCaptcha a b c d f =<< L.readFile f
+solveCaptchaFromFile :: (MonadBaseControl IO m, MonadResource m) => Int -> Int -> AntigateKey -> CaptchaConf -> FilePath -> Manager -> m (CaptchaID, String)
+solveCaptchaFromFile a b c d f m =
+    liftIO (S.readFile f) >>= \s -> solveCaptcha a b c d f s m
