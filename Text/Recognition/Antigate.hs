@@ -6,7 +6,7 @@
 -- > import Network
 -- > import Control.Monad
 -- > import Control.Monad.IO.Class
--- > import Data.ByteString hiding (putStrLn)
+-- > import Data.ByteString.Lazy hiding (putStrLn)
 -- > import System.Timeout
 -- > 
 -- > myAntigateKey :: String
@@ -71,7 +71,7 @@ import Control.Exception (Exception, throwIO)
 import qualified Data.Text.Lazy as TL (unpack)
 import qualified Data.Text.Lazy.Encoding as TL (decodeUtf8)
 import qualified Blaze.ByteString.Builder.Char.Utf8 as BlazeUtf8 (fromString)
-import qualified Data.ByteString as S (ByteString, readFile)
+import qualified Data.ByteString as S (ByteString)
 import Data.ByteString.Lazy.Char8()
 import Data.Default (Default(..))
 import Data.List (stripPrefix, isPrefixOf, intercalate)
@@ -179,7 +179,7 @@ data CheckResult = CHECK_OK String -- ^ the captcha is recognized, the guessed t
     deriving (Show, Read, Eq, Ord)
 
 data Field = Part S.ByteString S.ByteString
-           | File S.ByteString S.ByteString S.ByteString S.ByteString
+           | File S.ByteString S.ByteString S.ByteString L.ByteString
     deriving (Show)
 
 instance Default CaptchaConf where
@@ -202,7 +202,7 @@ renderField boundary (File name filename contenttype body) =
     copyByteString "--" <> copyByteString boundary <> copyByteString "\r\n"
     <> copyByteString "Content-Disposition: form-data; name=\"" <> fromByteString name <> copyByteString "\"; filename=\"" <> fromByteString filename
     <> copyByteString "\"\r\nContent-Type: " <> copyByteString contenttype
-    <> copyByteString "\r\n\r\n" <> fromByteString body <> copyByteString "\r\n"
+    <> copyByteString "\r\n\r\n" <> fromLazyByteString body <> copyByteString "\r\n"
 
 renderFields :: S.ByteString -> [Field] -> Builder
 renderFields boundary fields =
@@ -266,7 +266,7 @@ parseUploadResult s
 -- | upload captcha for recognition
 --
 -- throws 'HttpException' on network errors.
-uploadCaptcha :: (MonadBaseControl IO m, MonadResource m) => AntigateKey -> CaptchaConf -> FilePath -> S.ByteString -> Manager -> m UploadResult
+uploadCaptcha :: (MonadBaseControl IO m, MonadResource m) => AntigateKey -> CaptchaConf -> FilePath -> L.ByteString -> Manager -> m UploadResult
 uploadCaptcha key sets filename image m = do
     boundary <- liftIO $ randomBoundary
     let req = (fromJust $ parseUrl "http://antigate.com/in.php")
@@ -342,7 +342,7 @@ solveCaptcha :: (MonadBaseControl IO m, MonadResource m) =>
              -> AntigateKey
              -> CaptchaConf
              -> FilePath -- ^ image filename (antigate guesses filetype by file extension)
-             -> S.ByteString -- ^ image contents
+             -> L.ByteString -- ^ image contents
              -> Manager -- ^ HTTP connection manager to use
              -> m (CaptchaID, String)
 solveCaptcha sleepwait sleepcaptcha key conf filename image m = goupload
@@ -368,4 +368,4 @@ solveCaptcha sleepwait sleepcaptcha key conf filename image m = goupload
 -- | Same as 'solveCaptcha', but read contents from a file.
 solveCaptchaFromFile :: (MonadBaseControl IO m, MonadResource m) => Int -> Int -> AntigateKey -> CaptchaConf -> FilePath -> Manager -> m (CaptchaID, String)
 solveCaptchaFromFile a b c d f m =
-    liftIO (S.readFile f) >>= \s -> solveCaptcha a b c d f s m
+    liftIO (L.readFile f) >>= \s -> solveCaptcha a b c d f s m
