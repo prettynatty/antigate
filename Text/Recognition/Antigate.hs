@@ -1,4 +1,10 @@
-{-# LANGUAGE PatternGuards, OverloadedStrings, DeriveDataTypeable, FlexibleContexts #-}
+{-# LANGUAGE
+     PatternGuards
+    ,OverloadedStrings
+    ,DeriveDataTypeable
+    ,FlexibleContexts
+    ,RecordWildCards
+    #-}
 -- | Example:
 --
 -- > import Text.Recognition.Antigate
@@ -9,8 +15,8 @@
 -- > import Data.ByteString.Lazy hiding (putStrLn)
 -- > import System.Timeout
 -- > 
--- > myAntigateKey :: String
--- > myAntigateKey = "0123456789abcdef0123456789abcdef"
+-- > myApiKey :: ApiKey
+-- > myApiKey = "0123456789abcdef0123456789abcdef"
 -- > 
 -- > downloadJpegCaptcha :: Manager -> IO ByteString
 -- > downloadJpegCaptcha = undefined
@@ -22,9 +28,9 @@
 -- > main = withSocketsDo $ do
 -- >     res <- timeout (30*1000000) $ withManager $ \m -> do
 -- >         bytes <- liftIO $ downloadJpegCaptcha m
--- >         (id, answer) <- solveCaptcha (3*1000000) (3*1000000) myAntigateKey def{phrase=True} "captcha.jpg" bytes m
+-- >         (id, answer) <- solveCaptcha def myApiKey def{phrase=True} "captcha.jpg" bytes m
 -- >         res <- liftIO $ answerCaptcha answer m
--- >         unless res $ reportBad myAntigateKey id m
+-- >         unless res $ reportBad myApiKey id m
 -- >         return res
 -- >     case res of
 -- >         Nothing -> do
@@ -35,13 +41,15 @@
 -- >             putStrLn "Couldn't solve"
 
 module Text.Recognition.Antigate
-    (AntigateKey
+    (ApiKey(..)
     ,CaptchaID
     ,CaptchaConf(..)
     ,UploadResult(..)
     ,CheckResult(..)
     -- * High level
     ,SolveException(..)
+    ,SolveConf(..)
+    ,Phase(..)
     ,solveCaptcha
     ,solveCaptchaFromFile
     -- * Core functions
@@ -67,10 +75,12 @@ module Text.Recognition.Antigate
 import qualified Data.Text as T
 import qualified Data.Text.Lazy as TL
 import qualified Data.Text.Lazy.Encoding as TLE
+import qualified Data.Text.Encoding.Error as TEE
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 
-import Network.HTTP.Conduit
+import Network.HTTP.Conduit hiding (httpLbs)
+import qualified Network.HTTP.Conduit
 import Network.HTTP.Conduit.MultipartFormData
 
 import Control.Concurrent (threadDelay)
@@ -82,17 +92,23 @@ import Control.Monad.IO.Class (liftIO)
 import Control.Monad (void)
 import Control.Applicative ((<$>))
 import Data.Default (Default(..))
-import Data.List (stripPrefix, isPrefixOf, intercalate)
-import Data.Maybe (catMaybes, fromMaybe, fromJust)
-import Data.String (fromString)
+import Data.List (stripPrefix, isPrefixOf, isInfixOf, intercalate)
+import Data.Maybe (catMaybes, fromMaybe)
+import Data.String (IsString(..))
 import Data.Word (Word)
 import Safe (readMay)
 import Text.Printf (printf)
 
-httpRequest :: MonadResource m => String -> Manager -> m BL.ByteString
-httpRequest u m = liftResourceT $ do
-    rq <- liftIO $ parseUrl u
-    responseBody <$> httpLbs rq{responseTimeout = Just 15000000} m
+decodeUtf8 :: BL.ByteString -> TL.Text
+decodeUtf8 = TLE.decodeUtf8With TEE.lenientDecode
+
+httpLbs :: Request (ResourceT IO) -> Manager -> ResourceT IO (Response BL.ByteString)
+httpLbs r m = Network.HTTP.Conduit.httpLbs r{responseTimeout=Nothing} m
+
+httpGet :: MonadResource m => Manager -> String -> m BL.ByteString
+httpGet m u = liftResourceT $ do
+    rq <- parseUrl u
+    responseBody <$> httpLbs rq m
 
 delimit :: Char -> String -> [String]
 delimit _ [] = []
@@ -101,11 +117,26 @@ delimit a b =
         (c, []) -> [c]
         (c, (_:d)) -> c : delimit a d
 
-type AntigateKey = String
+-- | Antigate API access key paired with service provider's host.
+-- At least these services claim to support Antigate API: 
+-- Antigate, Captchabot, Decaptcher, ExpertDecoders, ImageTyperz,
+-- DeathByCaptcha and Pixodrom.
+data ApiKey = ApiKey
+    {api_host :: String -- ^ default: \"antigate.com\"
+    ,api_key :: String
+    }
+  deriving (Eq, Ord, Show, Read)
+
+instance Default ApiKey where
+    def = ApiKey{api_host = "antigate.com"
+                ,api_key = error "Default ApiKey => api_key is undefined"}
+
+instance IsString ApiKey where
+    fromString str = def{api_key=str}
 
 type CaptchaID = Int
 
--- | See <http://antigate.com/panel.php?action=api>
+-- | Properties of the captcha to be solved. See <http://antigate.com/panel.php?action=api>
 data CaptchaConf = CaptchaConf
     {phrase :: Bool -- ^ * 'False' = default value (one word)
                     --
@@ -155,15 +186,21 @@ data CheckResult = CHECK_OK String -- ^ the captcha is recognized, the guessed t
     deriving (Show, Read, Eq, Ord)
 
 instance Default CaptchaConf where
-    def = CaptchaConf {phrase = False
-                      ,regsense = False
-                      ,numeric = Nothing
-                      ,calc = False
-                      ,min_len = 0
-                      ,max_len = 0
-                      ,is_russian = False
-                      ,max_bid = Nothing
-                      }
+    def = CaptchaConf
+        {phrase = False
+        ,regsense = False
+        ,numeric = Nothing
+        ,calc = False
+        ,min_len = 0
+        ,max_len = 0
+        ,is_russian = False
+        ,max_bid = Nothing
+        }
+
+hostExt :: String -> String
+hostExt host
+    | "pixodrom.com" `isInfixOf` host = "aspx"
+    | otherwise = "php"
 
 captchaConfFields :: (Monad m, Monad m') => CaptchaConf -> [Part m m']
 captchaConfFields c = catMaybes
@@ -194,19 +231,20 @@ captchaConfFields c = catMaybes
 -- | report bad captcha result
 --
 -- throws 'HttpException' on network errors.
-reportBad :: MonadResource m => AntigateKey -> CaptchaID -> Manager -> m ()
-reportBad key captchaid m = liftResourceT $
-    void $ flip httpRequest m $
-        "http://antigate.com/res.php?key=" ++ key ++
-            "&action=reportbad&id=" ++ show captchaid
+reportBad :: MonadResource m => ApiKey -> CaptchaID -> Manager -> m ()
+reportBad ApiKey{..} captchaid m =
+    void $ httpGet m $
+        "http://" ++ api_host ++ "/res." ++ hostExt api_host ++ "?key=" ++
+            api_key ++ "&action=reportbad&id=" ++ show captchaid
 
 -- | retrieve your current account balance
 --
 -- throws 'HttpException' on network errors.
-getBalance :: MonadResource m => AntigateKey -> Manager -> m Double
-getBalance key m = liftResourceT $
-    read . TL.unpack . TLE.decodeUtf8 <$> httpRequest
-        ("http://antigate.com/res.php?key="++ key ++"&action=getbalance") m
+getBalance :: MonadResource m => ApiKey -> Manager -> m Double
+getBalance ApiKey{..} m =
+    fmap (read . TL.unpack . decodeUtf8) $ httpGet m $
+        "http://"++ api_host ++ "/res." ++ hostExt api_host ++ "?key=" ++
+            api_key ++"&action=getbalance"
 
 -- | Marshal "UploadResult" back to its text form
 renderUploadResult :: UploadResult -> String
@@ -223,26 +261,26 @@ parseUploadResult s
         fromMaybe (UPLOAD_ERROR_UNKNOWN s) $
             UPLOAD_OK <$> (readMay =<< stripPrefix "OK|" s)
 
-inReq :: MonadResource m => Manager -> AntigateKey -> CaptchaConf -> Part m (ResourceT IO) -> m UploadResult
-inReq m key conf part = do
+inReq :: MonadResource m => Manager -> ApiKey -> CaptchaConf -> Part m (ResourceT IO) -> m UploadResult
+inReq m ApiKey{..} conf part = do
+    url <- liftIO $ parseUrl $ "http://" ++ api_host ++ "/in." ++ hostExt api_host
     req <- (`formDataBody` url) $
         ([partBS "method" "post"
-         ,partBS "key" (fromString key)
+         ,partBS "key" (fromString api_key)
         ]) ++
         (captchaConfFields conf
         ) ++
         [part]
-    liftResourceT $ parseUploadResult . TL.unpack . TLE.decodeUtf8 . responseBody <$> httpLbs req m
-  where url = fromJust (parseUrl "http://antigate.com/in.php")
+    liftResourceT $ parseUploadResult . TL.unpack . decodeUtf8 . responseBody <$> httpLbs req m
 
 -- | upload captcha for recognition
 --
 -- throws 'HttpException' on network errors.
-uploadCaptcha :: MonadResource m => AntigateKey -> CaptchaConf -> FilePath -> BL.ByteString -> Manager -> m UploadResult
+uploadCaptcha :: MonadResource m => ApiKey -> CaptchaConf -> FilePath -> BL.ByteString -> Manager -> m UploadResult
 uploadCaptcha key sets filename image m = do
     inReq m key sets $ partFileRequestBody "file" filename $ RequestBodyLBS image
 
-uploadCaptchaFromFile :: MonadResource m => AntigateKey -> CaptchaConf -> FilePath -> Manager -> m UploadResult
+uploadCaptchaFromFile :: MonadResource m => ApiKey -> CaptchaConf -> FilePath -> Manager -> m UploadResult
 uploadCaptchaFromFile key sets filename m = do
     inReq m key sets $ partFile "file" filename
 
@@ -275,58 +313,82 @@ parseCheckResults = map parseCheckResultNoOK . delimit '|'
 -- | retrieve captcha status
 --
 -- throws 'HttpException' on network errors.
-checkCaptcha :: MonadResource m => AntigateKey -> CaptchaID -> Manager -> m CheckResult
-checkCaptcha key captchaid m = liftResourceT $ do
-    parseCheckResult . TL.unpack . TLE.decodeUtf8 <$> httpRequest
-        ("http://antigate.com/res.php?key="++ key ++"&action=get&id="++ show captchaid) m
+checkCaptcha :: MonadResource m => ApiKey -> CaptchaID -> Manager -> m CheckResult
+checkCaptcha ApiKey{..} captchaid m =
+    fmap (parseCheckResult . TL.unpack . decodeUtf8) $ httpGet m $
+        "http://" ++ api_host ++ "/res." ++ hostExt api_host ++ "?key=" ++
+            api_key ++ "&action=get&id=" ++ show captchaid
 
 -- | retrieve multiple captcha status
 --
 -- throws 'HttpException' on network errors.
-checkCaptchas :: MonadResource m => AntigateKey -> [CaptchaID] -> Manager -> m [CheckResult]
-checkCaptchas key captchaids m = liftResourceT $ do
-    parseCheckResults . TL.unpack . TLE.decodeUtf8 <$> httpRequest
-        ("http://antigate.com/res.php?key="++ key ++"&action=get&ids="++
-            intercalate "," (map show captchaids)) m
+checkCaptchas :: MonadResource m => ApiKey -> [CaptchaID] -> Manager -> m [CheckResult]
+checkCaptchas ApiKey{..} captchaids m =
+    fmap (parseCheckResults . TL.unpack . decodeUtf8) $ httpGet m $
+        "http://" ++ api_host ++ "/res." ++ hostExt api_host ++ "?key=" ++
+            api_key ++ "&action=get&ids=" ++ intercalate "," (map show captchaids)
 
 data SolveException = SolveExceptionUpload UploadResult
                     | SolveExceptionCheck CaptchaID CheckResult
-    deriving (Show, Typeable)
+  deriving (Show, Typeable)
 
 instance Exception SolveException
+
+data Phase = UploadPhase | CheckPhase
+  deriving (Show, Read, Eq, Ord, Enum, Bounded)
+
+data SolveConf = SolveConf
+    {api_upload_sleep :: Int -- ^ how much to sleep while waiting for available slot. Microseconds.
+    ,api_check_sleep :: Int -- ^ how much to sleep between captcha checks. Microseconds.
+    ,api_counter :: Phase -> IO () -- ^ This action will be executed before each sleep. e.g. 'System.IO.print'
+    }
+
+instance Default SolveConf where
+    def = SolveConf
+        {api_upload_sleep = 3000000
+        ,api_check_sleep = 3000000
+        ,api_counter = const (return ())
+        }
+
+instance Show SolveConf where
+    showsPrec d SolveConf{..} =
+        showParen (d>=11) $ showString "SolveConf{api_upload_sleep = " .
+            shows api_upload_sleep . showString ", api_check_sleep = " .
+                shows api_check_sleep . showString ", api_counter = <Phase -> IO ()>}"
 
 -- | High level function to solve captcha, blocks until answer is provided (about 2-10 seconds).
 --
 -- throws 'SolveException' or 'HttpException' when something goes wrong.
 solveCaptcha :: MonadResource m =>
-                Int -- ^ how much to sleep while waiting for available slot. Microseconds.
-             -> Int -- ^ how much to sleep between captcha checks. Microseconds.
-             -> AntigateKey
+                SolveConf
+             -> ApiKey
              -> CaptchaConf
              -> FilePath -- ^ image filename (antigate guesses filetype by file extension)
              -> BL.ByteString -- ^ image contents
              -> Manager -- ^ HTTP connection manager to use
              -> m (CaptchaID, String)
-solveCaptcha sleepwait sleepcaptcha key conf filename image m = goupload
-  where goupload = do
-            ur <- uploadCaptcha key conf filename image m
-            case ur of
-                ERROR_NO_SLOT_AVAILABLE -> do
-                    liftIO $ threadDelay sleepwait
-                    goupload
-                UPLOAD_OK i -> gocheck i
-                a -> liftIO $ throwIO $ SolveExceptionUpload a
-        gocheck captchaid = do
-            liftIO $ threadDelay sleepcaptcha
-            res <- checkCaptcha key captchaid m
-            case res of
-                CHECK_OK answer ->
-                    return (captchaid, answer)
-                CAPCHA_NOT_READY -> do
-                    liftIO $ threadDelay sleepcaptcha
-                    gocheck captchaid
-                ex -> liftIO $ throwIO $ SolveExceptionCheck captchaid ex
+solveCaptcha SolveConf{..} key conf filename image m = goupload
+  where
+    goupload = do
+        ur <- uploadCaptcha key conf filename image m
+        case ur of
+            ERROR_NO_SLOT_AVAILABLE -> do
+                liftIO $ api_counter UploadPhase
+                liftIO $ threadDelay api_upload_sleep
+                goupload
+            UPLOAD_OK i -> gocheck i
+            a -> liftIO $ throwIO $ SolveExceptionUpload a
+    gocheck captchaid = do
+        liftIO $ threadDelay api_check_sleep
+        res <- checkCaptcha key captchaid m
+        case res of
+            CHECK_OK answer ->
+                return (captchaid, answer)
+            CAPCHA_NOT_READY -> do
+                liftIO $ api_counter CheckPhase
+                gocheck captchaid
+            ex -> liftIO $ throwIO $ SolveExceptionCheck captchaid ex
 
-solveCaptchaFromFile :: (MonadBaseControl IO m, MonadResource m) => Int -> Int -> AntigateKey -> CaptchaConf -> FilePath -> Manager -> m (CaptchaID, String)
-solveCaptchaFromFile a b c d f m =
-    liftIO (BL.readFile f) >>= \s -> solveCaptcha a b c d f s m
+solveCaptchaFromFile :: (MonadBaseControl IO m, MonadResource m) => SolveConf -> ApiKey -> CaptchaConf -> FilePath -> Manager -> m (CaptchaID, String)
+solveCaptchaFromFile a b c d m =
+    liftIO (BL.readFile d) >>= \s -> solveCaptcha a b c d s m
