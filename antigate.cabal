@@ -1,5 +1,5 @@
 name: antigate
-version: 0.3
+version: 0.3.0.1
 synopsis: Haskell interface for antigate.com captcha recognition service, and other services which support its API.
 description: Haskell interface for antigate.com captcha recognition service, and other services which support its API (e.g. captchabot, decaptcher).
 category: Network APIs, CAPTCHA, Text Recognition
@@ -18,7 +18,7 @@ source-repository head
   location: git://github.com/exbb2/antigate.git
 
 library
-    build-depends: base == 4.*
+    build-depends: base >= 4.5 && < 5
                   ,http-conduit >= 1.8.7
                   ,bytestring
                   ,text
