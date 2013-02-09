@@ -127,12 +127,10 @@ data ApiKey = ApiKey
     }
   deriving (Eq, Ord, Show, Read)
 
-instance Default ApiKey where
-    def = ApiKey{api_host = "antigate.com"
-                ,api_key = error "Default ApiKey => api_key is undefined"}
-
 instance IsString ApiKey where
-    fromString str = def{api_key=str}
+    fromString str = ApiKey
+            {api_host = "antigate.com"
+            ,api_key = str}
 
 type CaptchaID = Int
 
