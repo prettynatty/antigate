@@ -1,5 +1,6 @@
 {-# LANGUAGE
      PatternGuards
+    ,BangPatterns
     ,OverloadedStrings
     ,DeriveDataTypeable
     ,FlexibleContexts
@@ -338,14 +339,16 @@ data Phase = UploadPhase | CheckPhase
 data SolveConf = SolveConf
     {api_upload_sleep :: Int -- ^ how much to sleep while waiting for available slot. Microseconds.
     ,api_check_sleep :: Int -- ^ how much to sleep between captcha checks. Microseconds.
-    ,api_counter :: Phase -> IO () -- ^ This action will be executed before each sleep. e.g. 'System.IO.print'
+    ,api_counter :: Phase -- ^ Current solving phase
+                 -> Int   -- ^ Number of times counter was called during this phase, starting at @0@
+                 -> IO () -- ^ This action will be executed before each sleep. e.g. 'System.IO.print'
     }
 
 instance Default SolveConf where
     def = SolveConf
         {api_upload_sleep = 3000000
         ,api_check_sleep = 3000000
-        ,api_counter = const (return ())
+        ,api_counter = const (const (return ()))
         }
 
 instance Show SolveConf where
@@ -365,26 +368,26 @@ solveCaptcha :: MonadResource m =>
              -> BL.ByteString -- ^ image contents
              -> Manager -- ^ HTTP connection manager to use
              -> m (CaptchaID, String)
-solveCaptcha SolveConf{..} key conf filename image m = goupload
+solveCaptcha SolveConf{..} key conf filename image m = goupload 0
   where
-    goupload = do
+    goupload !c = do
         ur <- uploadCaptcha key conf filename image m
         case ur of
             ERROR_NO_SLOT_AVAILABLE -> do
-                liftIO $ api_counter UploadPhase
+                liftIO $ api_counter UploadPhase c
                 liftIO $ threadDelay api_upload_sleep
-                goupload
-            UPLOAD_OK i -> gocheck i
+                goupload (c+1)
+            UPLOAD_OK i -> gocheck i 0
             a -> liftIO $ throwIO $ SolveExceptionUpload a
-    gocheck captchaid = do
+    gocheck captchaid !c = do
         liftIO $ threadDelay api_check_sleep
         res <- checkCaptcha key captchaid m
         case res of
             CHECK_OK answer ->
                 return (captchaid, answer)
             CAPCHA_NOT_READY -> do
-                liftIO $ api_counter CheckPhase
-                gocheck captchaid
+                liftIO $ api_counter CheckPhase c
+                gocheck captchaid (c+1)
             ex -> liftIO $ throwIO $ SolveExceptionCheck captchaid ex
 
 solveCaptchaFromFile :: (MonadBaseControl IO m, MonadResource m) => SolveConf -> ApiKey -> CaptchaConf -> FilePath -> Manager -> m (CaptchaID, String)

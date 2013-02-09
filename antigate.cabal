@@ -1,5 +1,5 @@
 name: antigate
-version: 0.3.1
+version: 0.3.2
 synopsis: Haskell interface for antigate.com captcha recognition service and services supporting its API
 description: Haskell interface for antigate.com captcha recognition service and other services (e.g. captchabot, decaptcher)
 category: Network APIs, CAPTCHA, Text Recognition
