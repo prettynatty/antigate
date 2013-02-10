@@ -1,13 +1,16 @@
 {-# LANGUAGE
-     PatternGuards
+     DeriveFunctor
+    ,PatternGuards
     ,BangPatterns
     ,OverloadedStrings
     ,DeriveDataTypeable
     ,FlexibleContexts
     ,RecordWildCards
+    ,CPP
     #-}
 -- | Example:
 --
+-- > {-# LANGUAGE OverloadedStrings #-}
 -- > import Text.Recognition.Antigate
 -- > import Data.Default
 -- > import Network
@@ -45,8 +48,7 @@ module Text.Recognition.Antigate
     (ApiKey(..)
     ,CaptchaID
     ,CaptchaConf(..)
-    ,UploadResult(..)
-    ,CheckResult(..)
+    ,ApiResult(..)
     -- * High level
     ,SolveException(..)
     ,SolveConf(..)
@@ -66,12 +68,11 @@ module Text.Recognition.Antigate
     ,closeManager
     ,withManager
     -- * Miscellaneous
-    ,parseUploadResult
-    ,parseCheckResult
-    ,parseCheckResults
-    ,parseCheckResultNoOK
-    ,renderUploadResult
-    ,renderCheckResult
+    ,parseUploadResponse
+    ,parseCheckResponse
+    ,parseMultiCheckResponse
+    ,parseMultiCheckResponses
+    ,renderApiResult
     ) where
 import qualified Data.Text as T
 import qualified Data.Text.Lazy as TL
@@ -79,6 +80,7 @@ import qualified Data.Text.Lazy.Encoding as TLE
 import qualified Data.Text.Encoding.Error as TEE
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
+import Data.ByteString.Lazy.Char8()
 
 import Network.HTTP.Conduit hiding (httpLbs)
 import qualified Network.HTTP.Conduit
@@ -90,8 +92,7 @@ import Data.Typeable (Typeable)
 
 import Control.Monad.Trans.Resource
 import Control.Monad.IO.Class (liftIO)
-import Control.Monad (void)
-import Control.Applicative ((<$>))
+import Control.Applicative ((<$>), (<$))
 import Data.Default (Default(..))
 import Data.List (stripPrefix, isPrefixOf, isInfixOf, intercalate)
 import Data.Maybe (catMaybes, fromMaybe)
@@ -164,25 +165,21 @@ data CaptchaConf = CaptchaConf
     }
     deriving (Show, Read)
 
-data UploadResult = UPLOAD_OK CaptchaID -- ^ result is positive, your captcha is accepted for recognition and its ID follows. You may now attempt to retrieve captcha status with this ID.
-                  | ERROR_WRONG_USER_KEY -- ^ user authorization key is invalid (its length is not 32 bytes as it should be)
-                  | UPLOAD_ERROR_KEY_DOES_NOT_EXIST -- ^ you have set wrong user authorization key in request
-                  | ERROR_ZERO_BALANCE -- ^ account has zero or negative balance
-                  | ERROR_NO_SLOT_AVAILABLE -- ^ no idle captcha workers are available at the moment, please try a bit later or try increasing your bid
-                  | ERROR_ZERO_CAPTCHA_FILESIZE -- ^ the size of the captcha you are uploading or pointing to is zero
-                  | ERROR_TOO_BIG_CAPTCHA_FILESIZE -- ^ your captcha size is exceeding 100kb limit
-                  | ERROR_WRONG_FILE_EXTENSION -- ^ your captcha file has wrong extension, the only allowed extensions are gif,jpg,jpeg,png
-                  | ERROR_IMAGE_TYPE_NOT_SUPPORTED -- ^ Could not determine captcha file type, only allowed formats are JPG, GIF, PNG
-                  | ERROR_IP_NOT_ALLOWED -- ^ Request with current account key is not allowed from your IP. Please refer to IP list section
-                  | UPLOAD_ERROR_UNKNOWN String
-    deriving (Show, Read, Eq, Ord)
-
-data CheckResult = CHECK_OK String -- ^ the captcha is recognized, the guessed text follows
-                 | CAPCHA_NOT_READY -- ^ captcha is not recognized yet, repeat request withing 1-5 seconds
-                 | CHECK_ERROR_KEY_DOES_NOT_EXIST -- ^ you have set wrong user authorization key in request
-                 | ERROR_WRONG_ID_FORMAT -- ^ the captcha ID you are sending is non-numeric
-                 | CHECK_ERROR_UNKNOWN String
-    deriving (Show, Read, Eq, Ord)
+data ApiResult a
+    = OK a
+    | CAPCHA_NOT_READY -- ^ captcha is not recognized yet, repeat request withing 1-5 seconds
+    | ERROR_WRONG_USER_KEY -- ^ user authorization key is invalid (its length is not 32 bytes as it should be)
+    | ERROR_WRONG_ID_FORMAT -- ^ the captcha ID you are sending is non-numeric
+    | ERROR_KEY_DOES_NOT_EXIST -- ^ you have set wrong user authorization key in request
+    | ERROR_ZERO_BALANCE -- ^ account has zero or negative balance
+    | ERROR_NO_SLOT_AVAILABLE -- ^ no idle captcha workers are available at the moment, please try a bit later or try increasing your bid
+    | ERROR_ZERO_CAPTCHA_FILESIZE -- ^ the size of the captcha you are uploading or pointing to is zero
+    | ERROR_TOO_BIG_CAPTCHA_FILESIZE -- ^ your captcha size is exceeding 100kb limit
+    | ERROR_WRONG_FILE_EXTENSION -- ^ your captcha file has wrong extension, the only allowed extensions are gif,jpg,jpeg,png
+    | ERROR_IMAGE_TYPE_NOT_SUPPORTED -- ^ Could not determine captcha file type, only allowed formats are JPG, GIF, PNG
+    | ERROR_IP_NOT_ALLOWED -- ^ Request with current account key is not allowed from your IP. Please refer to IP list section
+    | ERROR_UNKNOWN String
+  deriving (Show, Read, Eq, Functor)
 
 instance Default CaptchaConf where
     def = CaptchaConf
@@ -230,11 +227,12 @@ captchaConfFields c = catMaybes
 -- | report bad captcha result
 --
 -- throws 'HttpException' on network errors.
-reportBad :: MonadResource m => ApiKey -> CaptchaID -> Manager -> m ()
-reportBad ApiKey{..} captchaid m =
-    void $ httpGet m $
+reportBad :: MonadResource m => ApiKey -> CaptchaID -> Manager -> m Bool
+reportBad ApiKey{..} captchaid m = do
+    lbs <- httpGet m $
         "http://" ++ api_host ++ "/res." ++ hostExt api_host ++ "?key=" ++
             api_key ++ "&action=reportbad&id=" ++ show captchaid
+    return $ lbs == "OK_REPORT_RECORDED"
 
 -- | retrieve your current account balance
 --
@@ -245,23 +243,8 @@ getBalance ApiKey{..} m =
         "http://"++ api_host ++ "/res." ++ hostExt api_host ++ "?key=" ++
             api_key ++"&action=getbalance"
 
--- | Marshal "UploadResult" back to its text form
-renderUploadResult :: UploadResult -> String
-renderUploadResult (UPLOAD_OK i) = "OK|" ++ show i
-renderUploadResult (UPLOAD_ERROR_UNKNOWN s) = s
-renderUploadResult a = show a
-
--- | Parse antigate's upload response
-parseUploadResult :: String -> UploadResult
-parseUploadResult "ERROR_KEY_DOES_NOT_EXIST" = UPLOAD_ERROR_KEY_DOES_NOT_EXIST
-parseUploadResult s
-    | Just e <- readMay s = e
-    | otherwise =
-        fromMaybe (UPLOAD_ERROR_UNKNOWN s) $
-            UPLOAD_OK <$> (readMay =<< stripPrefix "OK|" s)
-
-inReq :: MonadResource m => Manager -> ApiKey -> CaptchaConf -> Part m (ResourceT IO) -> m UploadResult
-inReq m ApiKey{..} conf part = do
+uploadReq :: MonadResource m => Manager -> ApiKey -> CaptchaConf -> Part m (ResourceT IO) -> m (ApiResult CaptchaID)
+uploadReq m ApiKey{..} conf part = do
     url <- liftIO $ parseUrl $ "http://" ++ api_host ++ "/in." ++ hostExt api_host
     req <- (`formDataBody` url) $
         ([partBS "method" "post"
@@ -270,65 +253,73 @@ inReq m ApiKey{..} conf part = do
         (captchaConfFields conf
         ) ++
         [part]
-    liftResourceT $ parseUploadResult . TL.unpack . decodeUtf8 . responseBody <$> httpLbs req m
+    liftResourceT $ parseUploadResponse . TL.unpack . decodeUtf8 . responseBody <$> httpLbs req m
 
 -- | upload captcha for recognition
 --
 -- throws 'HttpException' on network errors.
-uploadCaptcha :: MonadResource m => ApiKey -> CaptchaConf -> FilePath -> BL.ByteString -> Manager -> m UploadResult
+uploadCaptcha :: MonadResource m => ApiKey -> CaptchaConf -> FilePath -> BL.ByteString -> Manager -> m (ApiResult CaptchaID)
 uploadCaptcha key sets filename image m = do
-    inReq m key sets $ partFileRequestBody "file" filename $ RequestBodyLBS image
+    uploadReq m key sets $ partFileRequestBody "file" filename $ RequestBodyLBS image
 
-uploadCaptchaFromFile :: MonadResource m => ApiKey -> CaptchaConf -> FilePath -> Manager -> m UploadResult
+uploadCaptchaFromFile :: MonadResource m => ApiKey -> CaptchaConf -> FilePath -> Manager -> m (ApiResult CaptchaID)
 uploadCaptchaFromFile key sets filename m = do
-    inReq m key sets $ partFile "file" filename
+    uploadReq m key sets $ partFile "file" filename
 
--- | Marshal "CheckResult" back to its text form 
-renderCheckResult :: CheckResult -> String
-renderCheckResult (CHECK_OK s) = "OK|" ++ s
-renderCheckResult (CHECK_ERROR_UNKNOWN s) = s
-renderCheckResult a = show a
+-- | Marshal "ApiResult" back to its text form
+renderApiResult :: ApiResult String -> String
+renderApiResult (OK s) = "OK|" ++ s
+renderApiResult (ERROR_UNKNOWN s) = s
+renderApiResult a = show a
+
+-- | Parse antigate's upload response
+parseUploadResponse :: String -> ApiResult CaptchaID
+parseUploadResponse s
+    | Just e <- readMay s = e
+    | otherwise =
+        fromMaybe (ERROR_UNKNOWN s) $
+            OK <$> (readMay =<< stripPrefix "OK|" s)
 
 -- | Parse antigate's check response
-parseCheckResult :: String -> CheckResult
-parseCheckResult "ERROR_KEY_DOES_NOT_EXIST" = CHECK_ERROR_KEY_DOES_NOT_EXIST
-parseCheckResult s
+parseCheckResponse :: String -> ApiResult String
+parseCheckResponse s
     | Just e <- readMay s = e
-    | otherwise = fromMaybe (CHECK_ERROR_UNKNOWN s) $
-                        CHECK_OK <$> stripPrefix "OK|" s
+    | otherwise =
+        fromMaybe (ERROR_UNKNOWN s) $
+            OK <$> stripPrefix "OK|" s
 
 -- | Parse antigate's multi-check response
-parseCheckResultNoOK :: String -> CheckResult
-parseCheckResultNoOK "ERROR_KEY_DOES_NOT_EXIST" = CHECK_ERROR_KEY_DOES_NOT_EXIST
-parseCheckResultNoOK s
+parseMultiCheckResponse :: String -> ApiResult String
+parseMultiCheckResponse s
     | Just e <- readMay s = e
-    | isPrefixOf "ERROR_" s = CHECK_ERROR_UNKNOWN s
-    | otherwise = CHECK_OK s
+    | isPrefixOf "ERROR_" s = ERROR_UNKNOWN s
+    | otherwise = OK s
 
 -- | Parse antigate's multi-check response
-parseCheckResults :: String -> [CheckResult]
-parseCheckResults = map parseCheckResultNoOK . delimit '|'
+parseMultiCheckResponses :: String -> [ApiResult String]
+parseMultiCheckResponses = map parseMultiCheckResponse . delimit '|'
 
 -- | retrieve captcha status
 --
 -- throws 'HttpException' on network errors.
-checkCaptcha :: MonadResource m => ApiKey -> CaptchaID -> Manager -> m CheckResult
+checkCaptcha :: MonadResource m => ApiKey -> CaptchaID -> Manager -> m (ApiResult String)
 checkCaptcha ApiKey{..} captchaid m =
-    fmap (parseCheckResult . TL.unpack . decodeUtf8) $ httpGet m $
+    fmap (parseCheckResponse . TL.unpack . decodeUtf8) $ httpGet m $
         "http://" ++ api_host ++ "/res." ++ hostExt api_host ++ "?key=" ++
             api_key ++ "&action=get&id=" ++ show captchaid
 
 -- | retrieve multiple captcha status
 --
 -- throws 'HttpException' on network errors.
-checkCaptchas :: MonadResource m => ApiKey -> [CaptchaID] -> Manager -> m [CheckResult]
+checkCaptchas :: MonadResource m => ApiKey -> [CaptchaID] -> Manager -> m [ApiResult String]
 checkCaptchas ApiKey{..} captchaids m =
-    fmap (parseCheckResults . TL.unpack . decodeUtf8) $ httpGet m $
+    fmap (parseMultiCheckResponses . TL.unpack . decodeUtf8) $ httpGet m $
         "http://" ++ api_host ++ "/res." ++ hostExt api_host ++ "?key=" ++
             api_key ++ "&action=get&ids=" ++ intercalate "," (map show captchaids)
 
-data SolveException = SolveExceptionUpload UploadResult
-                    | SolveExceptionCheck CaptchaID CheckResult
+data SolveException
+    = SolveExceptionUpload (ApiResult ())
+    | SolveExceptionCheck CaptchaID (ApiResult ())
   deriving (Show, Typeable)
 
 instance Exception SolveException
@@ -337,59 +328,91 @@ data Phase = UploadPhase | CheckPhase
   deriving (Show, Read, Eq, Ord, Enum, Bounded)
 
 data SolveConf = SolveConf
-    {api_upload_sleep :: Int -- ^ how much to sleep while waiting for available slot. Microseconds.
-    ,api_check_sleep :: Int -- ^ how much to sleep between captcha checks. Microseconds.
-    ,api_counter :: Phase -- ^ Current solving phase
-                 -> Int   -- ^ Number of times phase was retried, calling a counter each time.
-                 -> IO () -- ^ This action will be executed before each sleep. e.g. 'System.IO.print'
+    {
+    -- | how much to sleep while waiting for available slot; in microseconds.
+    --
+    -- Default: @[3000000]@
+     api_upload_sleep :: [Int]
+    -- | how much to sleep between captcha checks; in microseconds.
+    --
+    -- Default: @[6000000,2000000,3000000] -- sleep 6 seconds before checking, on first retry sleep 2 seconds, then always sleep 3 seconds. List can be infinite@
+    ,api_check_sleep :: [Int]
+    -- | 'api_counter' will be called at the start of each phase
+    --
+    -- > api_counter = \phase count -> do
+    -- >     if count == 0
+    -- >       then putStrLn $ show phase ++ " began"
+    -- >       else putStrLn $ show phase ++ " retries: " ++ show count
+    --
+    -- Default: @\_ _ -> return ()@
+    ,api_counter :: Phase
+                 -> Int
+                 -> IO ()
+    ,api_upload_callback :: CaptchaID -> IO () -- ^ This will be called when upload phase finishes
     }
 
 instance Default SolveConf where
     def = SolveConf
-        {api_upload_sleep = 3000000
-        ,api_check_sleep = 3000000
+        {api_upload_sleep = [3000000]
+        ,api_check_sleep = [6000000,2000000,3000000]
         ,api_counter = const (const (return ()))
+        ,api_upload_callback = const (return ())
         }
 
 instance Show SolveConf where
     showsPrec d SolveConf{..} =
         showParen (d>=11) $ showString "SolveConf{api_upload_sleep = " .
             shows api_upload_sleep . showString ", api_check_sleep = " .
-                shows api_check_sleep . showString ", api_counter = <Phase -> IO ()>}"
+                shows api_check_sleep . showString
+                    ", api_counter = <Phase -> Int -> IO ()>, api_upload_callback = <CaptchaID -> IO ()>}"
 
 -- | High level function to solve captcha, blocks until answer is provided (about 2-10 seconds).
 --
 -- throws 'SolveException' or 'HttpException' when something goes wrong.
-solveCaptcha :: MonadResource m =>
-                SolveConf
+solveCaptcha :: MonadResource m
+             => SolveConf
              -> ApiKey
              -> CaptchaConf
              -> FilePath -- ^ image filename (antigate guesses filetype by file extension)
              -> BL.ByteString -- ^ image contents
              -> Manager -- ^ HTTP connection manager to use
              -> m (CaptchaID, String)
-solveCaptcha SolveConf{..} key conf filename image m = goupload 1
+solveCaptcha SolveConf{..} key conf filename image m = do
+    liftIO $ api_counter UploadPhase 0
+    captchaid <- goupload 1 api_upload_sleep
+    liftIO $ api_upload_callback captchaid
+    liftIO $ api_counter CheckPhase 0
+    gocheck captchaid 1 api_check_sleep
   where
-    goupload !c = do
+    goupload _ [] = error "solveCaptcha: api_upload_sleep is empty"
+    goupload !c s_@(s:ss) = do
         ur <- uploadCaptcha key conf filename image m
         case ur of
             ERROR_NO_SLOT_AVAILABLE -> do
                 liftIO $ api_counter UploadPhase c
-                liftIO $ threadDelay api_upload_sleep
-                goupload (c+1)
-            UPLOAD_OK i -> gocheck i 1
-            a -> liftIO $ throwIO $ SolveExceptionUpload a
-    gocheck captchaid !c = do
-        liftIO $ threadDelay api_check_sleep
+                liftIO $ threadDelay s
+                goupload (c+1) (if null ss then cycle s_ else ss)
+            OK i -> return i
+            a -> liftIO $ throwIO $ SolveExceptionUpload $ () <$ a
+    gocheck _ _ [] = error "solveCaptcha: api_check_sleep is empty"
+    gocheck captchaid !c s_@(s:ss) = do
+        liftIO $ threadDelay s
         res <- checkCaptcha key captchaid m
         case res of
-            CHECK_OK answer ->
-                return (captchaid, answer)
             CAPCHA_NOT_READY -> do
                 liftIO $ api_counter CheckPhase c
-                gocheck captchaid (c+1)
-            ex -> liftIO $ throwIO $ SolveExceptionCheck captchaid ex
+                gocheck captchaid (c+1) (if null ss then cycle s_ else ss)
+            OK answer ->
+                return (captchaid, answer)
+            ex -> liftIO $ throwIO $ SolveExceptionCheck captchaid $ () <$ ex
 
 solveCaptchaFromFile :: (MonadBaseControl IO m, MonadResource m) => SolveConf -> ApiKey -> CaptchaConf -> FilePath -> Manager -> m (CaptchaID, String)
-solveCaptchaFromFile a b c d m =
-    liftIO (BL.readFile d) >>= \s -> solveCaptcha a b c d s m
+solveCaptchaFromFile a b c d m = do
+    s <- liftIO (fromStrict' <$> BS.readFile d)
+    solveCaptcha a b c d s m
+  where
+#if MIN_VERSION_bytestring(0,10,0)
+    fromStrict' = fromStrict
+#else
+    fromStrict' x = BL.fromChunks [x]
+#endif
