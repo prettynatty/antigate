@@ -340,7 +340,7 @@ data SolveConf = SolveConf
     {api_upload_sleep :: Int -- ^ how much to sleep while waiting for available slot. Microseconds.
     ,api_check_sleep :: Int -- ^ how much to sleep between captcha checks. Microseconds.
     ,api_counter :: Phase -- ^ Current solving phase
-                 -> Int   -- ^ Number of times counter was called during this phase, starting at @0@
+                 -> Int   -- ^ Number of times phase was retried, calling a counter each time.
                  -> IO () -- ^ This action will be executed before each sleep. e.g. 'System.IO.print'
     }
 
@@ -368,7 +368,7 @@ solveCaptcha :: MonadResource m =>
              -> BL.ByteString -- ^ image contents
              -> Manager -- ^ HTTP connection manager to use
              -> m (CaptchaID, String)
-solveCaptcha SolveConf{..} key conf filename image m = goupload 0
+solveCaptcha SolveConf{..} key conf filename image m = goupload 1
   where
     goupload !c = do
         ur <- uploadCaptcha key conf filename image m
@@ -377,7 +377,7 @@ solveCaptcha SolveConf{..} key conf filename image m = goupload 0
                 liftIO $ api_counter UploadPhase c
                 liftIO $ threadDelay api_upload_sleep
                 goupload (c+1)
-            UPLOAD_OK i -> gocheck i 0
+            UPLOAD_OK i -> gocheck i 1
             a -> liftIO $ throwIO $ SolveExceptionUpload a
     gocheck captchaid !c = do
         liftIO $ threadDelay api_check_sleep
