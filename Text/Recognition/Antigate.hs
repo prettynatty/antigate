@@ -412,7 +412,7 @@ solveCaptchaFromFile a b c d m = do
     solveCaptcha a b c d s m
   where
 #if MIN_VERSION_bytestring(0,10,0)
-    fromStrict' = fromStrict
+    fromStrict' = BL.fromStrict
 #else
     fromStrict' x = BL.fromChunks [x]
 #endif
