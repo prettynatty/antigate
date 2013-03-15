@@ -18,16 +18,16 @@
 -- > import Control.Monad.IO.Class
 -- > import Data.ByteString.Lazy hiding (putStrLn)
 -- > import System.Timeout
--- > 
+-- >
 -- > myApiKey :: ApiKey
--- > myApiKey = "0123456789abcdef0123456789abcdef"
--- > 
+-- > myApiKey = "0123456789abcdef0123456789abcdef"{api_host="antigate.com"}
+-- >
 -- > downloadJpegCaptcha :: Manager -> IO ByteString
 -- > downloadJpegCaptcha = undefined
--- > 
+-- >
 -- > answerCaptcha :: String -> Manager -> IO Bool
 -- > answerCaptcha = undefined
--- > 
+-- >
 -- > main :: IO ()
 -- > main = withSocketsDo $ do
 -- >     res <- timeout (30*1000000) $ withManager $ \m -> do
@@ -45,7 +45,9 @@
 -- >             putStrLn "Couldn't solve"
 
 module Text.Recognition.Antigate
-    (ApiKey(..)
+    (ApiKey
+    ,api_key
+    ,api_host
     ,CaptchaID
     ,CaptchaConf(..)
     ,ApiResult(..)
@@ -120,14 +122,20 @@ delimit a b =
         (c, (_:d)) -> c : delimit a d
 
 -- | Antigate API access key paired with service provider's host.
--- At least these services claim to support Antigate API: 
+-- At least these services claim to support Antigate API:
 -- Antigate, Captchabot, Decaptcher, ExpertDecoders, ImageTyperz,
 -- DeathByCaptcha and Pixodrom.
 data ApiKey = ApiKey
-    {api_host :: String -- ^ default: \"antigate.com\"
-    ,api_key :: String
+    {api_host :: String -- ^ default: \"antigate.com\". This is a record selector
+    ,api_key :: String -- ^ This is a record selector
     }
   deriving (Eq, Ord, Show, Read)
+
+instance Default ApiKey where
+    def = ApiKey
+        {api_host = "antigate.com"
+        ,api_key = "API KEY IS UNSET"
+        }
 
 instance IsString ApiKey where
     fromString str = ApiKey
@@ -148,19 +156,19 @@ data CaptchaConf = CaptchaConf
                            --
                            -- * 'Just' 'True' = captcha consists from numbers only
                            --
-                           -- * 'Just' 'False' = captcha does not have numbers on it 
+                           -- * 'Just' 'False' = captcha does not have numbers on it
     ,calc :: Bool -- ^ * 'False' = default value
                   --
                   -- * 'True' = numbers on captcha must be summed
     ,min_len :: Word -- ^ * 0 = default value
                      --
-                     -- * \>0 = minimum length of captcha text workers required to input 
+                     -- * \>0 = minimum length of captcha text workers required to input
     ,max_len :: Word -- ^ * 0 = default value (unlimited)
                      --
-                     -- * \>0 = maximum length of captcha text workers required to input 
+                     -- * \>0 = maximum length of captcha text workers required to input
     ,is_russian :: Bool -- ^ * 'False' = default value
                         --
-                        -- * 'True' = captcha goes to Russian-speaking worker 
+                        -- * 'True' = captcha goes to Russian-speaking worker
     ,max_bid :: Maybe Double -- ^ 'Default' value is set on bids page. This parameter allows to control maximum bid without setting it on the bids page.
     }
     deriving (Show, Read)
