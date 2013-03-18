@@ -10,7 +10,7 @@ maintainer: kudah <kudahkukarek@gmail.com>
 cabal-version: >= 1.8
 stability: experimental
 build-type: Simple
-tested-with: GHC == 7.4.1
+tested-with: GHC == 7.4.1, GHC == 7.6.2
 homepage: https://github.com/exbb2/antigate
 
 source-repository head
