@@ -1,7 +1,9 @@
 name: antigate
-version: 0.5
-synopsis: Haskell interface for antigate.com captcha recognition service and services supporting its API
-description: Haskell interface for antigate.com captcha recognition service and other services (e.g. captchabot, decaptcher)
+version: 0.6
+synopsis: Interface for antigate.com captcha recognition API
+description:
+    Haskell interface for antigate.com captcha recognition service
+    and other services supporting its API (e.g. captchabot, decaptcher)
 category: Network APIs, CAPTCHA, Text Recognition
 license: MIT
 license-file: LICENSE
@@ -26,6 +28,7 @@ library
                   ,safe
                   ,resourcet
                   ,transformers
+                  ,deepseq
 
     exposed-modules: Text.Recognition.Antigate
 
