@@ -86,14 +86,15 @@ import Data.ByteString.Lazy.Char8()
 
 import Network.HTTP.Conduit hiding (httpLbs)
 import qualified Network.HTTP.Conduit as HC
-import Network.HTTP.Conduit.MultipartFormData
+import Network.HTTP.Client.MultipartFormData
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (Exception, throwIO)
 import Data.Typeable (Typeable)
 
-import Control.Monad.Trans.Resource
-import Control.Monad.IO.Class (liftIO)
+import Control.Failure
+import Control.Monad.IO.Class
+import Control.Monad (liftM)
 import Control.Applicative ((<$>), (<$))
 import Data.Default (Default(..))
 import Data.List (stripPrefix, isPrefixOf, isInfixOf, intercalate)
@@ -111,14 +112,13 @@ __RESPONSE_TIMEOUT = 15000000
 decodeUtf8 :: BL.ByteString -> TL.Text
 decodeUtf8 = TLE.decodeUtf8With TEE.lenientDecode
 
-httpLbs :: Request (ResourceT IO) -> Manager -> ResourceT IO (Response BL.ByteString)
-httpLbs r =
-        HC.httpLbs r{responseTimeout=Just __RESPONSE_TIMEOUT}
+httpLbs :: MonadIO m => Request -> Manager -> m (Response BL.ByteString)
+httpLbs r = HC.httpLbs r{responseTimeout=Just __RESPONSE_TIMEOUT}
 
-httpGet :: MonadResource m => Manager -> String -> m BL.ByteString
-httpGet m u = liftResourceT $ do
+httpGet :: (Failure HttpException m, MonadIO m) => Manager -> String -> m BL.ByteString
+httpGet m u = do
     rq <- parseUrl u
-    responseBody <$> httpLbs rq m
+    responseBody `liftM` httpLbs rq m
 
 charDelimit :: Char -> String -> [String]
 charDelimit _ [] = []
@@ -226,7 +226,7 @@ hostExt host
     | "pixodrom.com" `isInfixOf` host = "aspx"
     | otherwise = "php"
 
-captchaConfFields :: (Monad m, Monad m') => CaptchaConf -> [Part m m']
+captchaConfFields :: CaptchaConf -> [Part]
 captchaConfFields c = catMaybes
         [bool "phrase" phrase
         ,bool "regsense" regsense
@@ -242,7 +242,7 @@ captchaConfFields c = catMaybes
           fromTri Nothing = "0"
           fromTri (Just True) = "1"
           fromTri (Just False) = "2"
-          optField :: (Monad m, Monad m', Eq a) => T.Text -> (a -> BS.ByteString) -> CaptchaConf -> (CaptchaConf -> a) -> Maybe (Part m m')
+          optField :: Eq a => T.Text -> (a -> BS.ByteString) -> CaptchaConf -> (CaptchaConf -> a) -> Maybe Part
           optField name conv conf get = do
             let rec = get conf
             if rec == get def
@@ -255,7 +255,7 @@ captchaConfFields c = catMaybes
 -- | report bad captcha result
 --
 -- throws 'HttpException' on network errors.
-reportBad :: MonadResource m => ApiKey -> CaptchaID -> Manager -> m Bool
+reportBad :: (Failure HttpException m, MonadIO m) => ApiKey -> CaptchaID -> Manager -> m Bool
 reportBad ApiKey{..} captchaid m = do
     lbs <- httpGet m $
         "http://" ++ api_host ++ "/res." ++ hostExt api_host ++ "?key=" ++
@@ -265,30 +265,28 @@ reportBad ApiKey{..} captchaid m = do
 -- | retrieve your current account balance
 --
 -- throws 'HttpException' on network errors.
-getBalance :: MonadResource m => ApiKey -> Manager -> m Double
+getBalance :: (Failure HttpException m, MonadIO m) => ApiKey -> Manager -> m Double
 getBalance ApiKey{..} m =
-    fmap (read . TL.unpack . decodeUtf8) $ httpGet m $
+    liftM (read . TL.unpack . decodeUtf8) $ httpGet m $
         "http://"++ api_host ++ "/res." ++ hostExt api_host ++ "?key=" ++
             api_key ++"&action=getbalance"
 
-uploadReq :: MonadResource m => Manager -> ApiKey -> CaptchaConf -> Part m (ResourceT IO) -> m (ApiResult CaptchaID)
+uploadReq :: (Failure HttpException m, MonadIO m) => Manager -> ApiKey -> CaptchaConf -> Part -> m (ApiResult CaptchaID)
 uploadReq m ApiKey{..} conf part = do
-    url <- liftIO $
-        parseUrl $ "http://" ++ api_host ++ "/in." ++ hostExt api_host
+    url <- parseUrl $ "http://" ++ api_host ++ "/in." ++ hostExt api_host
     req <- flip formDataBody url $
         [partBS "method" "post"
         ,partBS "key" $ fromString api_key]
         ++ captchaConfFields conf
         ++ [part]
-    liftResourceT $ do
-        res <- httpLbs req m
-        return $ parseUploadResponse $ TL.unpack $ decodeUtf8 $ responseBody res
+    res <- httpLbs req m
+    return $ parseUploadResponse $ TL.unpack $ decodeUtf8 $ responseBody res
 
 -- | upload captcha for recognition
 --
 -- throws 'HttpException' on network errors.
 uploadCaptcha
-    :: MonadResource m
+    :: (Failure HttpException m, MonadIO m)
     => ApiKey
     -> CaptchaConf
     -> FilePath
@@ -299,7 +297,7 @@ uploadCaptcha key sets filename image m = do
     uploadReq m key sets $ partFileRequestBody "file" filename $ RequestBodyLBS image
 
 uploadCaptchaFromFile
-    :: MonadResource m
+    :: (Failure HttpException m, MonadIO m)
     => ApiKey
     -> CaptchaConf
     -> FilePath
@@ -345,13 +343,13 @@ parseMultiCheckResponses = map parseMultiCheckResponse . charDelimit '|'
 --
 -- throws 'HttpException' on network errors.
 checkCaptcha
-    :: MonadResource m
+    :: (Failure HttpException m, MonadIO m)
     => ApiKey
     -> CaptchaID
     -> Manager
     -> m (ApiResult String)
 checkCaptcha ApiKey{..} captchaid m =
-    fmap (parseCheckResponse . TL.unpack . decodeUtf8) $ httpGet m $
+    liftM (parseCheckResponse . TL.unpack . decodeUtf8) $ httpGet m $
         "http://" ++ api_host ++ "/res." ++ hostExt api_host ++ "?key=" ++
             api_key ++ "&action=get&id=" ++ show captchaid
 
@@ -359,13 +357,13 @@ checkCaptcha ApiKey{..} captchaid m =
 --
 -- throws 'HttpException' on network errors.
 checkCaptchas
-    :: MonadResource m
+    :: (Failure HttpException m, MonadIO m)
     => ApiKey
     -> [CaptchaID]
     -> Manager
     -> m [ApiResult String]
 checkCaptchas ApiKey{..} captchaids m =
-    fmap (parseMultiCheckResponses . TL.unpack . decodeUtf8) $ httpGet m $
+    liftM (parseMultiCheckResponses . TL.unpack . decodeUtf8) $ httpGet m $
         "http://" ++ api_host ++ "/res." ++ hostExt api_host ++ "?key=" ++
             api_key ++ "&action=get&ids=" ++ intercalate "," (map show captchaids)
 
@@ -433,7 +431,7 @@ instance NFData SolveConf where
 --
 -- throws 'SolveException' or 'HttpException' when something goes wrong.
 solveCaptcha
-    :: MonadResource m
+    :: (Failure HttpException m, MonadIO m)
     => SolveConf
     -> ApiKey
     -> CaptchaConf
@@ -471,7 +469,7 @@ solveCaptcha SolveConf{..} key conf filename image m = do
             ex -> liftIO $ throwIO $ SolveExceptionCheck captchaid $ () <$ ex
 
 solveCaptchaFromFile
-    :: (MonadBaseControl IO m, MonadResource m)
+    :: (Failure HttpException m, MonadIO m)
     => SolveConf
     -> ApiKey
     -> CaptchaConf
