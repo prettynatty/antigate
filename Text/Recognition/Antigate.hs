@@ -90,6 +90,7 @@ import Network.HTTP.Client.MultipartFormData
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (Exception, throwIO)
+import Control.Monad.Catch (MonadThrow)
 import Data.Typeable (Typeable)
 
 import Control.Failure
@@ -115,7 +116,7 @@ decodeUtf8 = TLE.decodeUtf8With TEE.lenientDecode
 httpLbs :: MonadIO m => Request -> Manager -> m (Response BL.ByteString)
 httpLbs r = HC.httpLbs r{responseTimeout=Just __RESPONSE_TIMEOUT}
 
-httpGet :: (Failure HttpException m, MonadIO m) => Manager -> String -> m BL.ByteString
+httpGet :: (Failure HttpException m, MonadIO m, MonadThrow m) => Manager -> String -> m BL.ByteString
 httpGet m u = do
     rq <- parseUrl u
     responseBody `liftM` httpLbs rq m
@@ -255,7 +256,7 @@ captchaConfFields c = catMaybes
 -- | report bad captcha result
 --
 -- throws 'HttpException' on network errors.
-reportBad :: (Failure HttpException m, MonadIO m) => ApiKey -> CaptchaID -> Manager -> m Bool
+reportBad :: (Failure HttpException m, MonadIO m, MonadThrow m) => ApiKey -> CaptchaID -> Manager -> m Bool
 reportBad ApiKey{..} captchaid m = do
     lbs <- httpGet m $
         "http://" ++ api_host ++ "/res." ++ hostExt api_host ++ "?key=" ++
@@ -265,13 +266,13 @@ reportBad ApiKey{..} captchaid m = do
 -- | retrieve your current account balance
 --
 -- throws 'HttpException' on network errors.
-getBalance :: (Failure HttpException m, MonadIO m) => ApiKey -> Manager -> m Double
+getBalance :: (Failure HttpException m, MonadIO m, MonadThrow m) => ApiKey -> Manager -> m Double
 getBalance ApiKey{..} m =
     liftM (read . TL.unpack . decodeUtf8) $ httpGet m $
         "http://"++ api_host ++ "/res." ++ hostExt api_host ++ "?key=" ++
             api_key ++"&action=getbalance"
 
-uploadReq :: (Failure HttpException m, MonadIO m) => Manager -> ApiKey -> CaptchaConf -> Part -> m (ApiResult CaptchaID)
+uploadReq :: (Failure HttpException m, MonadIO m, MonadThrow m) => Manager -> ApiKey -> CaptchaConf -> Part -> m (ApiResult CaptchaID)
 uploadReq m ApiKey{..} conf part = do
     url <- parseUrl $ "http://" ++ api_host ++ "/in." ++ hostExt api_host
     req <- flip formDataBody url $
@@ -286,7 +287,7 @@ uploadReq m ApiKey{..} conf part = do
 --
 -- throws 'HttpException' on network errors.
 uploadCaptcha
-    :: (Failure HttpException m, MonadIO m)
+    :: (Failure HttpException m, MonadIO m, MonadThrow m)
     => ApiKey
     -> CaptchaConf
     -> FilePath
@@ -297,7 +298,7 @@ uploadCaptcha key sets filename image m = do
     uploadReq m key sets $ partFileRequestBody "file" filename $ RequestBodyLBS image
 
 uploadCaptchaFromFile
-    :: (Failure HttpException m, MonadIO m)
+    :: (Failure HttpException m, MonadIO m, MonadThrow m)
     => ApiKey
     -> CaptchaConf
     -> FilePath
@@ -343,7 +344,7 @@ parseMultiCheckResponses = map parseMultiCheckResponse . charDelimit '|'
 --
 -- throws 'HttpException' on network errors.
 checkCaptcha
-    :: (Failure HttpException m, MonadIO m)
+    :: (Failure HttpException m, MonadIO m, MonadThrow m)
     => ApiKey
     -> CaptchaID
     -> Manager
@@ -357,7 +358,7 @@ checkCaptcha ApiKey{..} captchaid m =
 --
 -- throws 'HttpException' on network errors.
 checkCaptchas
-    :: (Failure HttpException m, MonadIO m)
+    :: (Failure HttpException m, MonadIO m, MonadThrow m)
     => ApiKey
     -> [CaptchaID]
     -> Manager
@@ -431,7 +432,7 @@ instance NFData SolveConf where
 --
 -- throws 'SolveException' or 'HttpException' when something goes wrong.
 solveCaptcha
-    :: (Failure HttpException m, MonadIO m)
+    :: (Failure HttpException m, MonadIO m, MonadThrow m)
     => SolveConf
     -> ApiKey
     -> CaptchaConf
@@ -469,7 +470,7 @@ solveCaptcha SolveConf{..} key conf filename image m = do
             ex -> liftIO $ throwIO $ SolveExceptionCheck captchaid $ () <$ ex
 
 solveCaptchaFromFile
-    :: (Failure HttpException m, MonadIO m)
+    :: (Failure HttpException m, MonadIO m, MonadThrow m)
     => SolveConf
     -> ApiKey
     -> CaptchaConf
