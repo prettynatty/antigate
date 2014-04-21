@@ -107,6 +107,18 @@ import Text.Printf (printf)
 
 import Control.DeepSeq (NFData(..), deepseq)
 
+---
+import System.IO
+import Control.Concurrent
+
+debug :: String -> IO ()
+debug msg = do
+  threadId <- myThreadId
+  let msg' = "Thread[" ++ (show threadId) ++ "] " ++ msg
+  hPutStrLn stderr msg'
+  hFlush stderr
+---
+
 __RESPONSE_TIMEOUT :: Int
 __RESPONSE_TIMEOUT = 15000000
 
@@ -280,7 +292,10 @@ uploadReq m ApiKey{..} conf part = do
         ,partBS "key" $ fromString api_key]
         ++ captchaConfFields conf
         ++ [part]
+    liftIO $ debug . show $ req
+
     res <- httpLbs req m
+    liftIO $ debug . show $ res
     return $ parseUploadResponse $ TL.unpack $ decodeUtf8 $ responseBody res
 
 -- | upload captcha for recognition
@@ -450,24 +465,34 @@ solveCaptcha SolveConf{..} key conf filename image m = do
     goupload _ [] = error "solveCaptcha: api_upload_sleep is empty"
     goupload !c s_@(s:ss) = do
         ur <- uploadCaptcha key conf filename image m
+        liftIO $ debug $ "Captcha uploaded " ++ show ur
         case ur of
             ERROR_NO_SLOT_AVAILABLE -> do
+                liftIO $ debug "NO SLOT AVAILABLE"
                 liftIO $ api_counter UploadPhase c
                 liftIO $ threadDelay s
                 goupload (c+1) (if null ss then cycle s_ else ss)
-            OK i -> return i
-            a -> liftIO $ throwIO $ SolveExceptionUpload $ () <$ a
+            OK i -> do
+              liftIO $ debug "OK"
+              return i
+            a -> do
+              liftIO $ debug "SolveExceptionUpload"
+              liftIO $ throwIO $ SolveExceptionUpload $ () <$ a
     gocheck _ _ [] = error "solveCaptcha: api_check_sleep is empty"
     gocheck captchaid !c s_@(s:ss) = do
         liftIO $ threadDelay s
         res <- checkCaptcha key captchaid m
         case res of
             CAPCHA_NOT_READY -> do
+                liftIO $ debug "CAPTCHA_NOT_READY"
                 liftIO $ api_counter CheckPhase c
                 gocheck captchaid (c+1) (if null ss then cycle s_ else ss)
-            OK answer ->
+            OK answer -> do
+                liftIO $ debug "OK"
                 return (captchaid, answer)
-            ex -> liftIO $ throwIO $ SolveExceptionCheck captchaid $ () <$ ex
+            ex -> do
+              liftIO $ debug $ "SolveExceptionCheck" ++ show ex
+              liftIO $ throwIO $ SolveExceptionCheck captchaid $ () <$ ex
 
 solveCaptchaFromFile
     :: (Failure HttpException m, MonadIO m, MonadThrow m)
